@@ -2,6 +2,13 @@
 
 # python-ariston-api
 A Python module for controlling Ariston devices with cloud polling.
+
+This fork adds account-wide request serialization and pacing, a 30-second
+network timeout, bounded HTTP 429 backoff and avoids immediate retries of HTTP
+5xx responses. Galevo's diagnostic menu is refreshed every 30 minutes instead
+of on every state poll, while core temperatures and modes continue to refresh
+normally.
+
 The following devices are currently supported:
 - Ariston Alteas One 24
 - Ariston Velis Evo

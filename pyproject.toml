@@ -12,11 +12,11 @@ dependencies = [
     "aiohttp",
     "requests"
 ]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { file = "LICENSE" }
-version = "0.19.9"
+version = "0.20.0"
 dynamic = ['description']
 
 [project.urls]
-Repository = "https://github.com/fustom/python-ariston-api.git"
-Issues = "https://github.com/fustom/python-ariston-api/issues"
+Repository = "https://github.com/mauropriori/python-ariston-api.git"
+Issues = "https://github.com/mauropriori/python-ariston-api/issues"

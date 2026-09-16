@@ -4,7 +4,15 @@ import asyncio
 import logging
 from typing import Any, Optional, Type
 
-from .ariston_api import AristonAPI, ConnectionException
+from .ariston_api import (
+    AristonAPI,
+    ConnectionException,
+)
+from .ariston_api import (
+    RateLimitException as RateLimitException,
+)
+from .base_device import AristonBaseDevice
+from .bsb_device import AristonBsbDevice
 from .const import (
     ARISTON_API_URL,
     ARISTON_USER_AGENT,
@@ -13,17 +21,15 @@ from .const import (
     VelisDeviceAttribute,
     WheType,
 )
-from .bsb_device import AristonBsbDevice
-from .lux_device import AristonLuxDevice
-from .lux2_device import AristonLux2Device
-from .evo_one_device import AristonEvoOneDevice
 from .evo_device import AristonEvoDevice
+from .evo_one_device import AristonEvoOneDevice
 from .galevo_device import AristonGalevoDevice
+from .lux2_device import AristonLux2Device
+from .lux_device import AristonLuxDevice
+from .lydos_device import AristonLydosDevice
 from .lydos_hybrid_device import AristonLydosHybridDevice
 from .nuos_split_device import AristonNuosSplitDevice
-from .base_device import AristonBaseDevice
 from .velis_base_device import AristonVelisBaseDevice
-from .lydos_device import AristonLydosDevice
 
 _LOGGER = logging.getLogger(__name__)
 

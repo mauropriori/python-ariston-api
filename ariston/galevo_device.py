@@ -1,13 +1,17 @@
 """Galevo device class for Ariston module."""
 
 from __future__ import annotations
-import asyncio
 
+import asyncio
 import logging
+import time
 from datetime import date
 from typing import Any, Optional
 
-from .ariston_api import AristonAPI
+import aiohttp
+import requests
+
+from .ariston_api import AristonAPI, ConnectionException
 from .const import (
     ConsumptionProperties,
     ConsumptionTimeInterval,
@@ -18,16 +22,18 @@ from .const import (
     DeviceProperties,
     GasEnergyUnit,
     GasType,
+    MenuItemNames,
     PlantMode,
     PropertyType,
     ThermostatProperties,
     ZoneAttribute,
     ZoneMode,
-    MenuItemNames,
 )
 from .device import AristonDevice
 
 _LOGGER = logging.getLogger(__name__)
+
+_MENU_ITEMS_REFRESH_INTERVAL_SECONDS = 1800
 
 
 class AristonGalevoDevice(AristonDevice):
@@ -46,6 +52,20 @@ class AristonGalevoDevice(AristonDevice):
         self.consumptions_settings: dict[str, Any] = dict()
         self.energy_account: dict[str, Any] = dict()
         self.menu_items: list[dict[str, Any]] = list()
+        self._menu_items_last_updated = 0.0
+
+    def _menu_items_update_due(self) -> bool:
+        """Return whether the low-priority diagnostic data needs refreshing."""
+        return (
+            not self.menu_items
+            or time.monotonic() - self._menu_items_last_updated
+            >= _MENU_ITEMS_REFRESH_INTERVAL_SECONDS
+        )
+
+    def _store_menu_items(self, menu_items: list[dict[str, Any]]) -> None:
+        """Store refreshed diagnostic menu data."""
+        self.menu_items = menu_items
+        self._menu_items_last_updated = time.monotonic()
 
     @property
     def consumption_type(self) -> str:
@@ -99,7 +119,20 @@ class AristonGalevoDevice(AristonDevice):
             self.language_tag,
             self.umsys,
         )
-        self.menu_items = self.api.get_menu_items(self.gw)
+        if self._menu_items_update_due():
+            try:
+                self._store_menu_items(self.api.get_menu_items(self.gw))
+            except (
+                ConnectionException,
+                aiohttp.ClientError,
+                requests.RequestException,
+                TimeoutError,
+            ) as error:
+                _LOGGER.warning(
+                    "Could not refresh optional diagnostic menu items for %s: %s",
+                    self.name,
+                    error,
+                )
         self._update_state()
 
     async def async_update_state(self) -> None:
@@ -107,15 +140,26 @@ class AristonGalevoDevice(AristonDevice):
         if len(self.features) == 0:
             await self.async_get_features()
 
-        (self.data, self.menu_items) = await asyncio.gather(
-            self.api.async_get_properties(
-                self.gw,
-                self.features,
-                self.language_tag,
-                self.umsys,
-            ),
-            self.api.async_get_menu_items(self.gw),
+        self.data = await self.api.async_get_properties(
+            self.gw,
+            self.features,
+            self.language_tag,
+            self.umsys,
         )
+        if self._menu_items_update_due():
+            try:
+                self._store_menu_items(await self.api.async_get_menu_items(self.gw))
+            except (
+                ConnectionException,
+                aiohttp.ClientError,
+                requests.RequestException,
+                TimeoutError,
+            ) as error:
+                _LOGGER.warning(
+                    "Could not refresh optional diagnostic menu items for %s: %s",
+                    self.name,
+                    error,
+                )
         self._update_state()
 
     def _get_features(self) -> None:
