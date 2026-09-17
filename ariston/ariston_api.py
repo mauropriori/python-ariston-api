@@ -8,8 +8,9 @@ import math
 import re
 import threading
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any, ClassVar, Optional
-from weakref import WeakKeyDictionary
 
 import aiohttp
 import requests
@@ -50,6 +51,17 @@ _MIN_REQUEST_INTERVAL_SECONDS = 1.0
 _REQUEST_TIMEOUT_SECONDS = 30
 
 
+@asynccontextmanager
+async def _async_thread_lock(lock: threading.Lock) -> AsyncIterator[None]:
+    """Acquire a cross-thread lock without blocking the event loop."""
+    while not lock.acquire(blocking=False):
+        await asyncio.sleep(0.01)
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 def _parse_retry_after_seconds(headers: Any, content: bytes) -> int:
     """Return the server-requested pause for a HTTP 429 response."""
     retry_after = None
@@ -75,6 +87,8 @@ class _RequestState:
     def __init__(self) -> None:
         self.blocked_until = 0.0
         self.last_request_at = 0.0
+        self.token = ""
+        self.token_generation = 0
 
 
 class ConnectionException(Exception):
@@ -93,8 +107,9 @@ class AristonAPI:
     """Ariston API class"""
 
     _request_states: ClassVar[dict[str, _RequestState]] = {}
-    _sync_locks: ClassVar[dict[str, threading.Lock]] = {}
-    _async_locks: ClassVar[WeakKeyDictionary] = WeakKeyDictionary()
+    _request_locks: ClassVar[dict[str, threading.Lock]] = {}
+    _auth_locks: ClassVar[dict[str, threading.Lock]] = {}
+    _shared_state_lock: ClassVar[threading.RLock] = threading.RLock()
 
     def __init__(
         self,
@@ -114,47 +129,77 @@ class AristonAPI:
     @classmethod
     def _get_request_state(cls, key: str) -> _RequestState:
         """Get shared request state for one account and API endpoint."""
-        if key not in cls._request_states:
-            cls._request_states[key] = _RequestState()
-        return cls._request_states[key]
+        with cls._shared_state_lock:
+            if key not in cls._request_states:
+                cls._request_states[key] = _RequestState()
+            return cls._request_states[key]
 
     @classmethod
-    def _get_sync_lock(cls, key: str) -> threading.Lock:
-        """Get a request lock shared by synchronous clients for one account."""
-        if key not in cls._sync_locks:
-            cls._sync_locks[key] = threading.Lock()
-        return cls._sync_locks[key]
+    def _get_request_lock(cls, key: str) -> threading.Lock:
+        """Get the request lock shared by sync and async account clients."""
+        with cls._shared_state_lock:
+            if key not in cls._request_locks:
+                cls._request_locks[key] = threading.Lock()
+            return cls._request_locks[key]
 
     @classmethod
-    def _get_async_lock(cls, key: str) -> asyncio.Lock:
-        """Get a request lock shared by async clients on the current event loop."""
-        loop = asyncio.get_running_loop()
-        locks = cls._async_locks.setdefault(loop, {})
-        if key not in locks:
-            locks[key] = asyncio.Lock()
-        return locks[key]
+    def _get_auth_lock(cls, key: str) -> threading.Lock:
+        """Get the token-refresh lock shared by all account clients."""
+        with cls._shared_state_lock:
+            if key not in cls._auth_locks:
+                cls._auth_locks[key] = threading.Lock()
+            return cls._auth_locks[key]
 
     def _request_wait_seconds(self) -> float:
         """Calculate the pause needed before the next cloud request."""
         state = self._get_request_state(self.__request_key)
-        now = time.monotonic()
-        return max(
-            0.0,
-            state.blocked_until - now,
-            state.last_request_at + _MIN_REQUEST_INTERVAL_SECONDS - now,
-        )
+        with self._shared_state_lock:
+            now = time.monotonic()
+            return max(
+                0.0,
+                state.blocked_until - now,
+                state.last_request_at + _MIN_REQUEST_INTERVAL_SECONDS - now,
+            )
 
     def _mark_request_complete(self) -> None:
         """Record completion time to keep subsequent requests spaced apart."""
-        self._get_request_state(self.__request_key).last_request_at = time.monotonic()
+        state = self._get_request_state(self.__request_key)
+        with self._shared_state_lock:
+            state.last_request_at = time.monotonic()
+
+    def _request_token_snapshot(self) -> tuple[str, int]:
+        """Return the latest shared token and its generation."""
+        state = self._get_request_state(self.__request_key)
+        with self._shared_state_lock:
+            if state.token:
+                self.__token = state.token
+            return self.__token, state.token_generation
+
+    def _store_token(self, token: str) -> None:
+        """Publish a refreshed token to every client for this account."""
+        state = self._get_request_state(self.__request_key)
+        with self._shared_state_lock:
+            self.__token = token
+            state.token = token
+            state.token_generation += 1
+
+    def _adopt_newer_token(self, token_generation: int) -> bool:
+        """Adopt a token refreshed after the failed request, if available."""
+        state = self._get_request_state(self.__request_key)
+        with self._shared_state_lock:
+            if state.token_generation == token_generation or not state.token:
+                return False
+            self.__token = state.token
+            return True
 
     def _set_rate_limit(self, retry_after: int) -> int:
         """Pause every client for this account until the block expires."""
         wait_seconds = retry_after + _RATE_LIMIT_SAFETY_MARGIN_SECONDS
         state = self._get_request_state(self.__request_key)
-        state.blocked_until = max(
-            state.blocked_until, time.monotonic() + wait_seconds
-        )
+        with self._shared_state_lock:
+            state.blocked_until = max(
+                state.blocked_until, time.monotonic() + wait_seconds
+            )
         _LOGGER.warning(
             "Ariston cloud rate limit reached; pausing this account for %s seconds",
             wait_seconds,
@@ -164,21 +209,36 @@ class AristonAPI:
     def connect(self) -> bool:
         """Login to ariston cloud and get token"""
 
+        with self._get_auth_lock(self.__request_key):
+            return self._connect_without_auth_lock()
+
+    def _connect_without_auth_lock(self) -> bool:
+        """Login while the caller owns the shared authentication lock."""
+
         try:
-            response = self._post(
+            response = self.__request(
+                "POST",
                 f"{self.__api_url}{ARISTON_LOGIN}",
-                {"usr": self.__username, "pwd": self.__password},
+                body={"usr": self.__username, "pwd": self.__password},
+                allow_reauth=False,
             )
 
             if response is None:
                 return False
 
-            self.__token = response["token"]
+            self._store_token(response["token"])
 
             return True
 
         except Exception as error:
             raise ConnectionException() from error
+
+    def _refresh_token_after_unauthorized(self, token_generation: int) -> bool:
+        """Refresh the token once, or adopt one refreshed by another request."""
+        with self._get_auth_lock(self.__request_key):
+            if self._adopt_newer_token(token_generation):
+                return True
+            return self._connect_without_auth_lock()
 
     def get_detailed_devices(self) -> list[Any]:
         """Get detailed cloud devices"""
@@ -567,25 +627,27 @@ class AristonAPI:
         path: str,
         params: Optional[dict[str, Any]] = None,
         body: Any = None,
-        is_retry: bool = False,
+        auth_retry: bool = False,
+        rate_retry: bool = False,
+        allow_reauth: bool = True,
     ) -> Optional[dict[str, Any]]:
         """Request with requests"""
-        headers: dict[str, Any] = {
-            "User-Agent": self.__user_agent,
-            "ar.authToken": self.__token,
-        }
-
         _LOGGER.debug(
             "Request method %s, path: %s, params: %s",
             method,
             path,
             params,
         )
-        with self._get_sync_lock(self.__request_key):
+        with self._get_request_lock(self.__request_key):
             wait_seconds = self._request_wait_seconds()
             if wait_seconds > 0:
                 time.sleep(wait_seconds)
 
+            token, token_generation = self._request_token_snapshot()
+            headers: dict[str, Any] = {
+                "User-Agent": self.__user_agent,
+                "ar.authToken": token,
+            }
             response = requests.request(
                 method,
                 path,
@@ -595,26 +657,46 @@ class AristonAPI:
                 timeout=_REQUEST_TIMEOUT_SECONDS,
             )
             self._mark_request_complete()
+            rate_limit_wait = (
+                self._set_rate_limit(
+                    _parse_retry_after_seconds(response.headers, response.content)
+                )
+                if response.status_code == 429
+                else 0
+            )
 
         if not response.ok:
             match response.status_code:
                 case 405:
-                    if not is_retry:
-                        if self.connect():
-                            return self.__request(method, path, params, body, True)
+                    if allow_reauth and not auth_retry:
+                        if self._refresh_token_after_unauthorized(token_generation):
+                            return self.__request(
+                                method,
+                                path,
+                                params,
+                                body,
+                                auth_retry=True,
+                                rate_retry=rate_retry,
+                                allow_reauth=allow_reauth,
+                            )
                         raise ConnectionException("Login failed (password changed?)")
                     raise ConnectionException("Invalid token")
                 case 404:
                     return None
                 case 429:
                     content = response.content
-                    wait_seconds = self._set_rate_limit(
-                        _parse_retry_after_seconds(response.headers, content)
-                    )
-                    if not is_retry:
-                        time.sleep(wait_seconds)
-                        return self.__request(method, path, params, body, True)
-                    raise RateLimitException(wait_seconds, content)
+                    if not rate_retry:
+                        time.sleep(rate_limit_wait)
+                        return self.__request(
+                            method,
+                            path,
+                            params,
+                            body,
+                            auth_retry=auth_retry,
+                            rate_retry=True,
+                            allow_reauth=allow_reauth,
+                        )
+                    raise RateLimitException(rate_limit_wait, content)
                 case _:
                     raise ConnectionException(response.status_code)
 
@@ -636,21 +718,38 @@ class AristonAPI:
     async def async_connect(self) -> bool:
         """Async login to ariston cloud and get token"""
 
+        async with _async_thread_lock(self._get_auth_lock(self.__request_key)):
+            return await self._async_connect_without_auth_lock()
+
+    async def _async_connect_without_auth_lock(self) -> bool:
+        """Login while the caller owns the shared authentication lock."""
+
         try:
-            response = await self._async_post(
+            response = await self.__async_request(
+                "POST",
                 f"{self.__api_url}{ARISTON_LOGIN}",
-                {"usr": self.__username, "pwd": self.__password},
+                body={"usr": self.__username, "pwd": self.__password},
+                allow_reauth=False,
             )
 
             if response is None:
                 return False
 
-            self.__token = response["token"]
+            self._store_token(response["token"])
 
             return True
 
         except Exception as error:
             raise ConnectionException() from error
+
+    async def _async_refresh_token_after_unauthorized(
+        self, token_generation: int
+    ) -> bool:
+        """Refresh the token once, or adopt one refreshed by another request."""
+        async with _async_thread_lock(self._get_auth_lock(self.__request_key)):
+            if self._adopt_newer_token(token_generation):
+                return True
+            return await self._async_connect_without_auth_lock()
 
     async def async_get_detailed_devices(self) -> list[Any]:
         """Async get detailed cloud devices"""
@@ -1044,14 +1143,11 @@ class AristonAPI:
         path: str,
         params: Optional[dict[str, Any]] = None,
         body: Any = None,
-        is_retry: bool = False,
+        auth_retry: bool = False,
+        rate_retry: bool = False,
+        allow_reauth: bool = True,
     ) -> Optional[dict[str, Any]]:
         """Async request with aiohttp"""
-        headers: dict[str, Any] = {
-            "User-Agent": self.__user_agent,
-            "ar.authToken": self.__token,
-        }
-
         _LOGGER.debug(
             "Request method %s, path: %s, params: %s",
             method,
@@ -1059,45 +1155,70 @@ class AristonAPI:
             params,
         )
 
-        async with self._get_async_lock(self.__request_key):
+        async with _async_thread_lock(self._get_request_lock(self.__request_key)):
             wait_seconds = self._request_wait_seconds()
             if wait_seconds > 0:
                 await asyncio.sleep(wait_seconds)
 
+            token, token_generation = self._request_token_snapshot()
+            headers: dict[str, Any] = {
+                "User-Agent": self.__user_agent,
+                "ar.authToken": token,
+            }
             timeout = aiohttp.ClientTimeout(total=_REQUEST_TIMEOUT_SECONDS)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 response = await session.request(
                     method, path, params=params, json=body, headers=headers
                 )
                 content = await response.read()
-                response_json = await response.json() if response.ok and content else None
+                response_json = (
+                    await response.json() if response.ok and content else None
+                )
                 response_ok = response.ok
                 response_status = response.status
                 response_headers = response.headers
                 self._mark_request_complete()
+                rate_limit_wait = (
+                    self._set_rate_limit(
+                        _parse_retry_after_seconds(response_headers, content)
+                    )
+                    if response_status == 429
+                    else 0
+                )
 
         if not response_ok:
             match response_status:
                 case 405:
-                    if not is_retry:
-                        if await self.async_connect():
+                    if allow_reauth and not auth_retry:
+                        if await self._async_refresh_token_after_unauthorized(
+                            token_generation
+                        ):
                             return await self.__async_request(
-                                method, path, params, body, True
+                                method,
+                                path,
+                                params,
+                                body,
+                                auth_retry=True,
+                                rate_retry=rate_retry,
+                                allow_reauth=allow_reauth,
                             )
                         raise ConnectionException("Login failed (password changed?)")
                     raise ConnectionException("Invalid token")
                 case 404:
                     return None
                 case 429:
-                    wait_seconds = self._set_rate_limit(
-                        _parse_retry_after_seconds(response_headers, content)
-                    )
-                    if not is_retry:
-                        await asyncio.sleep(wait_seconds)
+                    if not rate_retry:
+                        await asyncio.sleep(rate_limit_wait)
                         return await self.__async_request(
-                            method, path, params, body, True
+                            method,
+                            path,
+                            params,
+                            body,
+                            auth_retry=auth_retry,
+                            rate_retry=True,
+                            allow_reauth=allow_reauth,
                         )
-                    raise RateLimitException(wait_seconds, content)
+                    raise RateLimitException(rate_limit_wait, content)
                 case _:
                     raise ConnectionException(response_status)
 

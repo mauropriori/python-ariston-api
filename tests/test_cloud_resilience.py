@@ -1,6 +1,7 @@
 """Tests for cloud request throttling and failure handling."""
 
 import asyncio
+import threading
 from unittest import TestCase
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -10,6 +11,8 @@ from ariston.ariston_api import (
     RateLimitException,
     _parse_retry_after_seconds,
 )
+from ariston.const import ARISTON_LOGIN, DeviceAttribute
+from ariston.galevo_device import AristonGalevoDevice
 
 
 class _AsyncResponse:
@@ -48,8 +51,8 @@ def _session_factory(responses, sessions):
 class CloudResilienceTests(TestCase):
     def setUp(self):
         AristonAPI._request_states.clear()
-        AristonAPI._sync_locks.clear()
-        AristonAPI._async_locks.clear()
+        AristonAPI._request_locks.clear()
+        AristonAPI._auth_locks.clear()
 
     def test_retry_after_parser_prefers_header_then_body(self):
         self.assertEqual(
@@ -205,3 +208,164 @@ class CloudResilienceTests(TestCase):
             asyncio.run(run()), [{"ok": True}, {"ok": True}]
         )
         self.assertEqual(max_active_requests, 1)
+
+    def test_async_unauthorized_requests_share_one_token_refresh(self):
+        login_calls = 0
+        unauthorized_calls = 0
+
+        class _Session:
+            def __init__(self, *, timeout):
+                self.timeout = timeout
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def request(self, _method, path, **kwargs):
+                nonlocal login_calls, unauthorized_calls
+                if path.endswith(ARISTON_LOGIN):
+                    login_calls += 1
+                    return _AsyncResponse(200, b"{}", {"token": "fresh"})
+
+                if kwargs["headers"]["ar.authToken"] == "stale":
+                    unauthorized_calls += 1
+                    return _AsyncResponse(405, b"invalid token")
+                return _AsyncResponse(200, b"{}", {"ok": path})
+
+        async def run():
+            first = AristonAPI("same-user", "pass")
+            second = AristonAPI("same-user", "pass")
+            first._store_token("stale")
+            with patch(
+                "ariston.ariston_api.aiohttp.ClientSession", _Session
+            ), patch("ariston.ariston_api._MIN_REQUEST_INTERVAL_SECONDS", 0):
+                return await asyncio.gather(
+                    first._async_get("https://example.test/first"),
+                    second._async_get("https://example.test/second"),
+                )
+
+        self.assertEqual(
+            asyncio.run(run()),
+            [
+                {"ok": "https://example.test/first"},
+                {"ok": "https://example.test/second"},
+            ],
+        )
+        self.assertEqual(login_calls, 1)
+        self.assertEqual(unauthorized_calls, 1)
+
+    def test_sync_and_async_clients_share_one_request_lock(self):
+        async_started = threading.Event()
+        release_async = threading.Event()
+        sync_started = threading.Event()
+        active_requests = 0
+        max_active_requests = 0
+
+        class _Session:
+            def __init__(self, *, timeout):
+                self.timeout = timeout
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def request(self, *args, **kwargs):
+                nonlocal active_requests, max_active_requests
+                active_requests += 1
+                max_active_requests = max(max_active_requests, active_requests)
+                async_started.set()
+                await asyncio.to_thread(release_async.wait)
+                active_requests -= 1
+                return _AsyncResponse(200, b"{}", {"async": True})
+
+        def sync_request(*args, **kwargs):
+            nonlocal active_requests, max_active_requests
+            active_requests += 1
+            max_active_requests = max(max_active_requests, active_requests)
+            sync_started.set()
+            active_requests -= 1
+            response = MagicMock(
+                ok=True,
+                status_code=200,
+                content=b"{}",
+                headers={},
+            )
+            response.json.return_value = {"sync": True}
+            return response
+
+        async def run():
+            async_api = AristonAPI("same-user", "pass")
+            sync_api = AristonAPI("same-user", "pass")
+            with patch(
+                "ariston.ariston_api.aiohttp.ClientSession", _Session
+            ), patch(
+                "ariston.ariston_api.requests.request", sync_request
+            ), patch("ariston.ariston_api._MIN_REQUEST_INTERVAL_SECONDS", 0):
+                async_task = asyncio.create_task(
+                    async_api._async_get("https://example.test/async")
+                )
+                await asyncio.to_thread(async_started.wait, 1)
+                sync_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        sync_api._get, "https://example.test/sync"
+                    )
+                )
+                await asyncio.sleep(0.05)
+                self.assertFalse(sync_started.is_set())
+                release_async.set()
+                return await asyncio.gather(async_task, sync_task)
+
+        self.assertEqual(
+            asyncio.run(run()), [{"async": True}, {"sync": True}]
+        )
+        self.assertEqual(max_active_requests, 1)
+
+    def test_galevo_empty_diagnostics_are_not_retried_every_poll(self):
+        async def run():
+            api = MagicMock()
+            api.async_get_properties = AsyncMock(return_value={})
+            api.async_get_menu_items = AsyncMock(return_value=[])
+            device = AristonGalevoDevice(
+                api,
+                {
+                    DeviceAttribute.GW: "nimbus-gateway",
+                    DeviceAttribute.NAME: "Nimbus",
+                },
+            )
+            device.features = {"loaded": True}
+            with patch(
+                "ariston.galevo_device.time.monotonic", return_value=100.0
+            ), patch.object(AristonGalevoDevice, "_update_state"):
+                await device.async_update_state()
+                await device.async_update_state()
+            return api.async_get_menu_items.await_count
+
+        self.assertEqual(asyncio.run(run()), 1)
+
+    def test_galevo_failed_diagnostics_are_not_retried_every_poll(self):
+        async def run():
+            api = MagicMock()
+            api.async_get_properties = AsyncMock(return_value={})
+            api.async_get_menu_items = AsyncMock(
+                side_effect=ConnectionException(500)
+            )
+            device = AristonGalevoDevice(
+                api,
+                {
+                    DeviceAttribute.GW: "nimbus-gateway",
+                    DeviceAttribute.NAME: "Nimbus",
+                },
+            )
+            device.features = {"loaded": True}
+            with patch(
+                "ariston.galevo_device.time.monotonic", return_value=100.0
+            ), patch.object(AristonGalevoDevice, "_update_state"):
+                await device.async_update_state()
+                await device.async_update_state()
+            return api.async_get_menu_items.await_count
+
+        self.assertEqual(asyncio.run(run()), 1)

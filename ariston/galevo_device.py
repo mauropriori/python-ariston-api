@@ -52,20 +52,23 @@ class AristonGalevoDevice(AristonDevice):
         self.consumptions_settings: dict[str, Any] = dict()
         self.energy_account: dict[str, Any] = dict()
         self.menu_items: list[dict[str, Any]] = list()
-        self._menu_items_last_updated = 0.0
+        self._menu_items_last_attempted: float | None = None
 
     def _menu_items_update_due(self) -> bool:
         """Return whether the low-priority diagnostic data needs refreshing."""
         return (
-            not self.menu_items
-            or time.monotonic() - self._menu_items_last_updated
+            self._menu_items_last_attempted is None
+            or time.monotonic() - self._menu_items_last_attempted
             >= _MENU_ITEMS_REFRESH_INTERVAL_SECONDS
         )
+
+    def _mark_menu_items_update_attempt(self) -> None:
+        """Rate-limit diagnostic calls even when the cloud request fails."""
+        self._menu_items_last_attempted = time.monotonic()
 
     def _store_menu_items(self, menu_items: list[dict[str, Any]]) -> None:
         """Store refreshed diagnostic menu data."""
         self.menu_items = menu_items
-        self._menu_items_last_updated = time.monotonic()
 
     @property
     def consumption_type(self) -> str:
@@ -120,6 +123,7 @@ class AristonGalevoDevice(AristonDevice):
             self.umsys,
         )
         if self._menu_items_update_due():
+            self._mark_menu_items_update_attempt()
             try:
                 self._store_menu_items(self.api.get_menu_items(self.gw))
             except (
@@ -147,6 +151,7 @@ class AristonGalevoDevice(AristonDevice):
             self.umsys,
         )
         if self._menu_items_update_due():
+            self._mark_menu_items_update_attempt()
             try:
                 self._store_menu_items(await self.api.async_get_menu_items(self.gw))
             except (
