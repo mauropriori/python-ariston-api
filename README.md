@@ -16,6 +16,12 @@ normally. It uses the independent `ariston_net_api` import namespace so it can
 coexist with the upstream `ariston` package used by legacy Home Assistant
 integrations.
 
+For Lydos Hybrid, the fork also preserves the last stable operating mode
+across a temporary BOOST cycle. If the cloud returns `null`, `0`, an unknown
+code or malformed data when BOOST ends, consumers continue to see the mode
+that preceded BOOST. This recovery is read-only and never writes a mode back
+to the appliance.
+
 The following devices are currently supported:
 - Ariston Alteas One 24
 - Ariston Velis Evo
