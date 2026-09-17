@@ -5,14 +5,14 @@ import threading
 from unittest import TestCase
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from ariston.ariston_api import (
+from ariston_net_api.ariston_api import (
     AristonAPI,
     ConnectionException,
     RateLimitException,
     _parse_retry_after_seconds,
 )
-from ariston.const import ARISTON_LOGIN, DeviceAttribute
-from ariston.galevo_device import AristonGalevoDevice
+from ariston_net_api.const import ARISTON_LOGIN, DeviceAttribute
+from ariston_net_api.galevo_device import AristonGalevoDevice
 
 
 class _AsyncResponse:
@@ -67,8 +67,8 @@ class CloudResilienceTests(TestCase):
         )
         self.assertEqual(_parse_retry_after_seconds({}, b"Too many requests"), 60)
 
-    @patch("ariston.ariston_api.time.sleep")
-    @patch("ariston.ariston_api.requests.request")
+    @patch("ariston_net_api.ariston_api.time.sleep")
+    @patch("ariston_net_api.ariston_api.requests.request")
     def test_sync_500_is_not_retried(self, request, _sleep):
         response = MagicMock(
             ok=False,
@@ -84,8 +84,8 @@ class CloudResilienceTests(TestCase):
         self.assertEqual(request.call_count, 1)
         self.assertEqual(request.call_args.kwargs["timeout"], 30)
 
-    @patch("ariston.ariston_api.time.sleep")
-    @patch("ariston.ariston_api.requests.request")
+    @patch("ariston_net_api.ariston_api.time.sleep")
+    @patch("ariston_net_api.ariston_api.requests.request")
     def test_sync_429_waits_and_retries_once(self, request, sleep):
         limited = MagicMock(
             ok=False,
@@ -115,7 +115,7 @@ class CloudResilienceTests(TestCase):
 
         async def run():
             with patch(
-                "ariston.ariston_api.aiohttp.ClientSession",
+                "ariston_net_api.ariston_api.aiohttp.ClientSession",
                 _session_factory(responses, sessions),
             ), self.assertRaises(ConnectionException):
                 await AristonAPI("user", "pass")._async_get(
@@ -136,10 +136,10 @@ class CloudResilienceTests(TestCase):
 
         async def run():
             with patch(
-                "ariston.ariston_api.aiohttp.ClientSession",
+                "ariston_net_api.ariston_api.aiohttp.ClientSession",
                 _session_factory(responses, sessions),
             ), patch(
-                "ariston.ariston_api.asyncio.sleep", new_callable=AsyncMock
+                "ariston_net_api.ariston_api.asyncio.sleep", new_callable=AsyncMock
             ) as sleep:
                 result = await AristonAPI("user", "pass")._async_get(
                     "https://example.test/state"
@@ -159,9 +159,11 @@ class CloudResilienceTests(TestCase):
 
         async def run():
             with patch(
-                "ariston.ariston_api.aiohttp.ClientSession",
+                "ariston_net_api.ariston_api.aiohttp.ClientSession",
                 _session_factory(responses, sessions),
-            ), patch("ariston.ariston_api.asyncio.sleep", new_callable=AsyncMock):
+            ), patch(
+                "ariston_net_api.ariston_api.asyncio.sleep", new_callable=AsyncMock
+            ):
                 with self.assertRaises(RateLimitException) as raised:
                     await AristonAPI("user", "pass")._async_get(
                         "https://example.test/state"
@@ -197,8 +199,10 @@ class CloudResilienceTests(TestCase):
             first = AristonAPI("same-user", "pass")
             second = AristonAPI("same-user", "pass")
             with patch(
-                "ariston.ariston_api.aiohttp.ClientSession", _Session
-            ), patch("ariston.ariston_api._MIN_REQUEST_INTERVAL_SECONDS", 0):
+                "ariston_net_api.ariston_api.aiohttp.ClientSession", _Session
+            ), patch(
+                "ariston_net_api.ariston_api._MIN_REQUEST_INTERVAL_SECONDS", 0
+            ):
                 return await asyncio.gather(
                     first._async_get("https://example.test/first"),
                     second._async_get("https://example.test/second"),
@@ -239,8 +243,10 @@ class CloudResilienceTests(TestCase):
             second = AristonAPI("same-user", "pass")
             first._store_token("stale")
             with patch(
-                "ariston.ariston_api.aiohttp.ClientSession", _Session
-            ), patch("ariston.ariston_api._MIN_REQUEST_INTERVAL_SECONDS", 0):
+                "ariston_net_api.ariston_api.aiohttp.ClientSession", _Session
+            ), patch(
+                "ariston_net_api.ariston_api._MIN_REQUEST_INTERVAL_SECONDS", 0
+            ):
                 return await asyncio.gather(
                     first._async_get("https://example.test/first"),
                     second._async_get("https://example.test/second"),
@@ -301,10 +307,12 @@ class CloudResilienceTests(TestCase):
             async_api = AristonAPI("same-user", "pass")
             sync_api = AristonAPI("same-user", "pass")
             with patch(
-                "ariston.ariston_api.aiohttp.ClientSession", _Session
+                "ariston_net_api.ariston_api.aiohttp.ClientSession", _Session
             ), patch(
-                "ariston.ariston_api.requests.request", sync_request
-            ), patch("ariston.ariston_api._MIN_REQUEST_INTERVAL_SECONDS", 0):
+                "ariston_net_api.ariston_api.requests.request", sync_request
+            ), patch(
+                "ariston_net_api.ariston_api._MIN_REQUEST_INTERVAL_SECONDS", 0
+            ):
                 async_task = asyncio.create_task(
                     async_api._async_get("https://example.test/async")
                 )
@@ -338,7 +346,7 @@ class CloudResilienceTests(TestCase):
             )
             device.features = {"loaded": True}
             with patch(
-                "ariston.galevo_device.time.monotonic", return_value=100.0
+                "ariston_net_api.galevo_device.time.monotonic", return_value=100.0
             ), patch.object(AristonGalevoDevice, "_update_state"):
                 await device.async_update_state()
                 await device.async_update_state()
@@ -362,7 +370,7 @@ class CloudResilienceTests(TestCase):
             )
             device.features = {"loaded": True}
             with patch(
-                "ariston.galevo_device.time.monotonic", return_value=100.0
+                "ariston_net_api.galevo_device.time.monotonic", return_value=100.0
             ), patch.object(AristonGalevoDevice, "_update_state"):
                 await device.async_update_state()
                 await device.async_update_state()

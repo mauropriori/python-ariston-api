@@ -1,13 +1,20 @@
-[![CodeQL](https://github.com/fustom/python-ariston-api/actions/workflows/codeql.yml/badge.svg)](https://github.com/fustom/python-ariston-api/actions/workflows/codeql.yml) [![Upload Python Package](https://github.com/fustom/python-ariston-api/actions/workflows/python-publish.yml/badge.svg)](https://github.com/fustom/python-ariston-api/actions/workflows/python-publish.yml)
+[![CodeQL](https://github.com/mauropriori/python-ariston-api/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/mauropriori/python-ariston-api/actions/workflows/codeql.yml)
 
-# python-ariston-api
-A Python module for controlling Ariston devices with cloud polling.
+# ariston-net-api
+A namespaced Python module for controlling Ariston devices with cloud polling.
+
+This is a focused maintenance fork of
+[fustom/python-ariston-api](https://github.com/fustom/python-ariston-api). The
+original implementation and device support remain credited to fustom and its
+contributors.
 
 This fork adds account-wide request serialization and pacing, a 30-second
 network timeout, bounded HTTP 429 backoff and avoids immediate retries of HTTP
 5xx responses. Galevo's diagnostic menu is refreshed every 30 minutes instead
 of on every state poll, while core temperatures and modes continue to refresh
-normally.
+normally. It uses the independent `ariston_net_api` import namespace so it can
+coexist with the upstream `ariston` package used by legacy Home Assistant
+integrations.
 
 The following devices are currently supported:
 - Ariston Alteas One 24
@@ -22,21 +29,21 @@ The following devices are currently supported:
 ## Installation
 Use pip3 to install the latest version of this module.
 ```
-pip3 install ariston
+pip3 install "ariston-net-api @ git+https://github.com/mauropriori/python-ariston-api.git"
 ```
 
 ## The easy way (recommended for testing the module)
-First, open Python 3 and import ariston module.
+First, open Python 3 and import the `ariston_net_api` module.
 ```
 python3
 ```
 ```python3
-import ariston
+import ariston_net_api
 ```
 ### Syncronous
 Discover devices if you dont know your gateway id. You can skip this step.
 ```python3
-raw_devices = ariston.discover("username", "password")
+raw_devices = ariston_net_api.discover("username", "password")
 ```
 For example the gateway id for your first device.
 ```python3
@@ -44,13 +51,13 @@ For example the gateway id for your first device.
 ```
 Get your device
 ```python3
-device = ariston.hello("username", "password", "gateway", is_metric, "location")
+device = ariston_net_api.hello("username", "password", "gateway", is_metric, "location")
 ```
 [Go use your device section](#use-your-device)
 ### Asyncronous
 ```python3
-raw_devices = await ariston.async_discover("username", "password")
-device = await ariston.async_hello("username", "password", "gateway", is_metric, "location")
+raw_devices = await ariston_net_api.async_discover("username", "password")
+device = await ariston_net_api.async_hello("username", "password", "gateway", is_metric, "location")
 ```
 [Go use your device section](#use-your-device)
 ## The ariston class way (recommended for integrate the module)
@@ -59,7 +66,7 @@ First, open Python 3 and import Ariston class from this module.
 python3
 ```
 ```python3
-from ariston import Ariston
+from ariston_net_api import Ariston
 ```
 Create a new Ariston instance
 ```python3
